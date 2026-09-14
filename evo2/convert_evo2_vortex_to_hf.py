@@ -7,7 +7,7 @@ needed, remaps every key to ``modeling_evo2.py``, applies the vortex
 HF folder: ``config.json`` + ``model.safetensors`` (auto-sharded) +
 ``tokenizer_config.json`` + ``vocab.json``.
 
-Usage (run where the checkpoint lives, NOT on a small instance):
+Usage (run on a machine with enough RAM, see Memory below):
     python convert_evo2_vortex_to_hf.py \
         --vortex_pt ~/.cache/huggingface/evo2_1b_base.pt \
         --variant evo2_1b_base \

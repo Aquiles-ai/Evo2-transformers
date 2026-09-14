@@ -1,7 +1,7 @@
 from transformers.configuration_utils import PretrainedConfig
 from typing import List, Optional
 
-# Based from https://raw.githubusercontent.com/ArcInstitute/evo2/refs/heads/main/evo2/configs/evo2-1b-8k.yml
+# Based on https://raw.githubusercontent.com/ArcInstitute/evo2/refs/heads/main/evo2/configs/evo2-1b-8k.yml
 # Full-transformers port: no vortex dependency. Defaults = evo2-1b-8k,
 # but all long-context variants (7b/20b/40b) are expressible via these fields.
 

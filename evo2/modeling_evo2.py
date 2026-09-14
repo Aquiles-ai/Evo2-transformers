@@ -1,52 +1,22 @@
 """Evo2 StripedHyena-2 modeling for transformers.
 
-Reference (read-only, never imported at runtime):
+References (read-only, not imported at runtime):
   - https://github.com/ArcInstitute/evo2 (evo2/configs/*.yml, evo2/models.py)
-  - vortex ``StripedHyena`` (``vortex/model/model.py``, ``layers.py``,
-    ``attention.py``, ``engine.py``, ``rotary.py``, ``utils.py``)
+  - vortex StripedHyena (model.py, layers.py, attention.py, engine.py,
+    rotary.py, utils.py)
 
-Architecture recap (parallel/stateless path only in v1):
-  - Tokenizer is byte-level: ``CharLevelTokenizer(512)``, ``eos/bos=0``,
-    ``pad=1``. See ``configuration_evo2.py``.
-  - Each decoder layer is one of: HCS (short FIR, len 7), HCM (medium FIR,
-    len 128, FFT), HCL (long implicit IIR from poles/residues, FFT),
-    or GQA attention with RoPE. Membership comes from
-    ``attn_layer_idxs / hcs_layer_idxs / hcm_layer_idxs / hcl_layer_idxs``.
-  - Hyena block order (faithful to vortex ``parallel_*``):
-    ``in_proj (H->3H) -> depthwise short FIR (causal) -> interleave ->
-    split(x2, x1, v) -> x1*v -> long conv (+D) -> *x2 -> out_proj ->
-    residual -> RMSNorm -> gated MLP -> residual``.
-  - Attention block order:
-    ``RMSNorm -> GQA+RoPE -> residual -> RMSNorm -> gated MLP -> residual``.
-  - Gated MLP: ``down(act(gate(x)) * up(x))`` with ``gelu`` on layer 0 and
-    ``nn.Identity`` on layer > 0 when ``evo2_style_activations=True``.
-  - RMSNorm here is exactly vortex's:
-    ``x / (||x||_2 * hidden^-0.5 + eps) * weight`` (eps *outside* the sqrt).
+Each decoder layer is one of HCS (short FIR, len 7), HCM (medium FIR,
+len 128, FFT), HCL (implicit IIR from poles/residues, FFT), or GQA
+attention with RoPE. Hyena order: in_proj, causal depthwise short FIR,
+interleave, split to (x2, x1, v), long conv on (x1*v) with D skip, gate
+by x2, out_proj, residual, RMSNorm, gated MLP, residual. RMSNorm adds
+eps after the scaled norm, as in vortex. The vortex to HF weight key
+map lives in convert_evo2_vortex_to_hf.py.
 
-Weight-conversion map (vortex key -> this file), for the future converter:
-  - ``embedding_layer.weight`` -> ``model.embed_tokens.weight``
-  - ``blocks.{i}.pre_norm.scale`` -> ``model.layers.{i}.mixer_norm.weight``
-  - ``blocks.{i}.post_norm.scale`` -> ``model.layers.{i}.mlp_norm.weight``
-  - Attention: ``blocks.{i}.inner_mha_cls.Wqkv.weight/bias`` ->
-    ``model.layers.{i}.mixer.qkv_proj`` (**after** the vortex
-    ``column_split`` row permutation; savanna checkpoints are stored
-    head-interleaved), ``...out_proj`` -> ``....out_proj``,
-    ``rotary_emb.inv_freq`` stays as ``inv_freq`` buffer.
-  - Hyena: ``blocks.{i}.projections.weight/bias`` -> ``....in_proj``,
-    ``blocks.{i}.filter.short_filter_weight/bias`` -> ``....short_conv_*``,
-    ``blocks.{i}.filter.h`` -> ``....long_filter`` (repeat-interleaved to
-    ``hidden`` rows when groups < hidden),
-    ``blocks.{i}.filter.log_poles/residues/D`` -> same names here,
-    ``blocks.{i}.out_filter_dense.*`` -> ``....out_proj.*``.
-  - MLP: ``blocks.{i}.mlp.l1/l2/l3`` -> ``....gate_proj/up_proj/down_proj``.
-  - ``norm.scale`` -> ``model.final_norm.weight``; LM head is tied to
-    ``embed_tokens`` when ``tie_word_embeddings=True``.
-
-v1 scope: training/scoring forward only (``use_cache=False``). The vortex
-stateful/recurrent decoding path (``step_fir``/``step_iir``) is intentionally
-*not* reimplemented here yet; ``generate(..., use_cache=False)`` recomputes.
-Long-context (262k/1M) FFT attention-free forward is O(N log N) per Hyena
-channel in fp32, correct but heavy; chunking + fp16/bf16 FFT is TODO.
+v1 scope: training/scoring forward only (use_cache=False). No recurrent
+state decoding yet, so generate recomputes the prefix each step.
+Long context FFT convs run in fp32 at O(N log N) per channel: correct
+but heavy; chunking and fp16/bf16 FFT are TODO.
 """
 
 import math
@@ -346,7 +316,7 @@ class Evo2HyenaMixer(nn.Module):
             z = _interleave(z)
 
         if self.filter_type in ("s", "m"):
-            # Gated second FIR: u = x1 * v; conv; (gated D iff len>=128); * x2.
+            # Short/medium FIR path (D skip only when len>=128).
             x2, x1, v = self._split(z)
             u = x1 * v
             h = self._long_filter_matrix()
@@ -358,7 +328,6 @@ class Evo2HyenaMixer(nn.Module):
             y = x2 * y
             return self.out_proj(y.permute(0, 2, 1))
 
-        # HCL implicit long conv via FFT.
         x2, x1, v = self._split(z)
         x1v = x1 * v
         h = self._iir_filter(L, x.device, x1v.dtype)
