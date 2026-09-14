@@ -41,9 +41,17 @@ Weight-conversion map (vortex key -> this file), for the future converter:
   - MLP: ``blocks.{i}.mlp.l1/l2/l3`` -> ``....gate_proj/up_proj/down_proj``.
   - ``norm.scale`` -> ``model.final_norm.weight``; LM head is tied to
     ``embed_tokens`` when ``tie_word_embeddings=True``.
+
+v1 scope: training/scoring forward only (``use_cache=False``). The vortex
+stateful/recurrent decoding path (``step_fir``/``step_iir``) is intentionally
+*not* reimplemented here yet; ``generate(..., use_cache=False)`` recomputes.
+Long-context (262k/1M) FFT attention-free forward is O(N log N) per Hyena
+channel in fp32, correct but heavy; chunking + fp16/bf16 FFT is TODO.
 """
 
-from typing import Optional, Tuple
+import math
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -425,6 +433,7 @@ class Evo2Model(Evo2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        **kwargs,
     ) -> BaseModelOutputWithPast:
         if input_ids is not None:
             x = self.embed_tokens(input_ids)
@@ -469,6 +478,7 @@ class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         out = self.model(
             input_ids=input_ids,

@@ -153,6 +153,24 @@ def _group_qkv_bias(b: torch.Tensor, num_heads: int, head_dim: int) -> torch.Ten
     return torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)], dim=0).contiguous()
 
 
+def _replace_tensor(model: torch.nn.Module, key: str, tensor: torch.Tensor) -> None:
+    """Swap one param/buffer object in the module tree.
+
+    Needed when the stored dtype differs from the model's: ``copy_`` would
+    silently cast back instead of replacing. Untied fp32-kept tensors only
+    (inv_freq buffers, poles/residues); never call on tied weights.
+    """
+    *path, leaf = key.split(".")
+    mod = model
+    for p in path:
+        mod = mod[int(p)] if p.isdigit() else getattr(mod, p)
+    old = getattr(mod, leaf)
+    if isinstance(old, torch.nn.Parameter):
+        setattr(mod, leaf, torch.nn.Parameter(tensor))
+    else:
+        setattr(mod, leaf, tensor)
+
+
 def convert_state_dict(vortex_sd: dict, config: Evo2Config, permute_wqkv: bool = True) -> dict:
     """Remap vortex ``StripedHyena`` keys to this package. Raises on mismatch."""
     hf = {}
@@ -222,6 +240,11 @@ def convert_state_dict(vortex_sd: dict, config: Evo2Config, permute_wqkv: bool =
             else:
                 hf[f"{dst}.mixer.log_poles"] = take(f"{src}.filter.log_poles")
                 hf[f"{dst}.mixer.residues"] = take(f"{src}.filter.residues")
+                tkey = f"{src}.mixer.mixer.filter.t"
+                if tkey in vortex_sd:
+                    t = take(tkey).to(torch.float32).reshape(-1)
+                    if not torch.equal(t, torch.arange(t.numel(), dtype=torch.float32)):
+                        raise ValueError(f"unexpected {tkey}: not a time grid")
             dkey = f"{src}.filter.D"
             if dkey in vortex_sd:
                 hf[f"{dst}.mixer.D"] = take(dkey)
@@ -289,11 +312,14 @@ def main() -> None:
         raise ValueError(f"key mismatch: missing={missing[:8]} extra={extra[:8]}")
 
     target = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    model.to(target)  # storage dtype for the bulk; _apply preserves tied weights
+    model_state = model.state_dict()  # re-capture: pre-.to() refs are stale
     with torch.no_grad():
         for k, v in hf.items():
-            want = model_state[k].dtype if k.endswith(FP32_KEEP_SUFFIXES) else target
-            model_state[k].copy_(v.to(want))
-    model.load_state_dict(model_state, strict=True)
+            if k.endswith(FP32_KEEP_SUFFIXES):
+                _replace_tensor(model, k, v.to(torch.float32).contiguous())
+            else:
+                model_state[k].copy_(v.to(target))
 
     total = sum(p.numel() for p in model.parameters())
     print(f"loaded OK: {total / 1e9:.2f}B params, saving to {args.out_dir}")
