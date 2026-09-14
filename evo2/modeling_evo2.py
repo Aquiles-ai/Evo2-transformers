@@ -41,20 +41,13 @@ Weight-conversion map (vortex key -> this file), for the future converter:
   - MLP: ``blocks.{i}.mlp.l1/l2/l3`` -> ``....gate_proj/up_proj/down_proj``.
   - ``norm.scale`` -> ``model.final_norm.weight``; LM head is tied to
     ``embed_tokens`` when ``tie_word_embeddings=True``.
-
-v1 scope: training/scoring forward only (``use_cache=False``). The vortex
-stateful/recurrent decoding path (``step_fir``/``step_iir``) is intentionally
-*not* reimplemented here yet; ``generate(..., use_cache=False)`` recomputes.
-Long-context (262k/1M) FFT attention-free forward is O(N log N) per Hyena
-channel in fp32, correct but heavy; chunking + fp16/bf16 FFT is TODO.
 """
 
-import math
-from typing import List, Optional, Tuple
-
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
@@ -119,10 +112,7 @@ def _fft_conv(u: torch.Tensor, k: torch.Tensor, d_bias: torch.Tensor) -> torch.T
     u32 = u.to(torch.float32)
     k32 = k.to(torch.float32)
     k_f = torch.fft.rfft(k32, n=n) / n
-    if k_f.dim() == 3 and k_f.shape[0] == 1 and u32.shape[0] > 1:
-        pass  # broadcast over batch, as in vortex
-    elif k_f.dim() == 2:  # [H, L] safety
-        k_f = k_f.unsqueeze(0)
+    k_f = k_f.reshape(-1, k_f.shape[-1]).unsqueeze(0)  # [1, H, F]
     u_f = torch.fft.rfft(u32, n=n)
     y = torch.fft.irfft(u_f * k_f, n=n, norm="forward")[..., :L]
     y = y + u32 * d_bias.to(torch.float32).unsqueeze(-1)
@@ -163,10 +153,10 @@ class Evo2RotaryEmbedding(nn.Module):
     def _cos_sin(self, seq_len: int, position_ids: torch.Tensor, dtype: torch.dtype, device) -> Tuple[torch.Tensor, torch.Tensor]:
         # position_ids: [B, L]; gather per-position angles
         freqs = torch.outer(torch.arange(seq_len, dtype=torch.float32, device=device), self.inv_freq.to(device).float())
-        emb = torch.cat([freqs, freqs], dim=-1)  # [L, D]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [L, D] angles
         pos = position_ids.long()  # [B, L]
-        cos = emb[pos].to(dtype)  # [B, L, D]
-        sin = emb[pos].to(dtype)
+        cos = emb.cos()[pos].to(dtype)  # [B, L, D]
+        sin = emb.sin()[pos].to(dtype)
         return cos, sin
 
     @staticmethod
@@ -358,7 +348,7 @@ class Evo2HyenaMixer(nn.Module):
             else:
                 y = _causal_depthwise_conv1d(u, h, bias=None)
             y = x2 * y
-            return y.permute(0, 2, 1)
+            return self.out_proj(y.permute(0, 2, 1))
 
         # HCL implicit long conv via FFT.
         x2, x1, v = self._split(z)
@@ -370,7 +360,7 @@ class Evo2HyenaMixer(nn.Module):
         # Padding mask (vortex multiplies post-FIR when bias present); apply cheaply.
         if isinstance(padding_mask, torch.Tensor):
             y = y * padding_mask[:, None, :]
-        return y.permute(0, 2, 1)
+        return self.out_proj(y.permute(0, 2, 1))
 
 
 # Decoder layer / full model / causal LM
@@ -461,8 +451,8 @@ class Evo2Model(Evo2PreTrainedModel):
         return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=None, hidden_states=all_hidden)
 
 
-class Evo2ForCausalLM(Evo2PreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Evo2Config):
         super().__init__(config)

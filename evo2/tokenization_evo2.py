@@ -25,28 +25,16 @@ class Evo2Tokenizer(PreTrainedTokenizer):
     model_input_names = ["input_ids", "attention_mask"]
     vocab_files_names = {}
 
-    def __init__(
-        self,
-        vocab_size: int = 512,
-        eos_token: str = "<eos>",
-        pad_token: str = "<pad>",
-        bos_token: str = "<eos>",
-        model_max_length: int = 1048576,
-        padding_side: str = "right",
-        **kwargs,
-    ):
+    def __init__(self, vocab_size: int = 512, **kwargs):
         self._vocab_size = vocab_size
-        super().__init__(
-            eos_token=eos_token,
-            pad_token=pad_token,
-            bos_token=bos_token,
-            unk_token=None,
-            add_bos_token=False,
-            add_eos_token=False,
-            model_max_length=model_max_length,
-            padding_side=padding_side,
-            **kwargs,
-        )
+        kwargs.setdefault("eos_token", "<eos>")
+        kwargs.setdefault("pad_token", "<pad>")
+        kwargs.setdefault("bos_token", "<eos>")
+        kwargs.setdefault("add_bos_token", False)
+        kwargs.setdefault("add_eos_token", False)
+        kwargs.setdefault("model_max_length", 1048576)
+        kwargs.setdefault("padding_side", "right")
+        super().__init__(**kwargs)
 
     @property
     def vocab_size(self) -> int:

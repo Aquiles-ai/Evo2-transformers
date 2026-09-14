@@ -98,6 +98,12 @@ class Evo2Config(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.final_norm = final_norm
         self.use_cache = use_cache
+        self.auto_map = {
+            "AutoConfig": "configuration_evo2.Evo2Config",
+            "AutoModel": "modeling_evo2.Evo2Model",
+            "AutoModelForCausalLM": "modeling_evo2.Evo2ForCausalLM",
+            "AutoTokenizer": "tokenization_evo2.Evo2Tokenizer"
+        }
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

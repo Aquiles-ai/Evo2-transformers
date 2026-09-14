@@ -153,9 +153,10 @@ def _group_qkv_bias(b: torch.Tensor, num_heads: int, head_dim: int) -> torch.Ten
     return torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)], dim=0).contiguous()
 
 
-def convert_state_dict(vortex_sd: dict, config: Evo2Config) -> dict:
+def convert_state_dict(vortex_sd: dict, config: Evo2Config, permute_wqkv: bool = True) -> dict:
     """Remap vortex ``StripedHyena`` keys to this package. Raises on mismatch."""
     hf = {}
+    consumed = set()
     heads = config.num_attention_heads
     head_dim = config.hidden_size // heads
     n_attn = n_hcs = n_hcm = n_hcl = 0
@@ -163,6 +164,7 @@ def convert_state_dict(vortex_sd: dict, config: Evo2Config) -> dict:
     def take(key: str) -> torch.Tensor:
         if key not in vortex_sd:
             raise KeyError(f"missing vortex key: {key}")
+        consumed.add(key)
         return vortex_sd[key]
 
     hf["model.embed_tokens.weight"] = take("embedding_layer.weight")
@@ -185,14 +187,19 @@ def convert_state_dict(vortex_sd: dict, config: Evo2Config) -> dict:
                 raise ValueError(f"unexpected Wqkv shape at layer {i}: {tuple(w.shape)}")
             if heads // max(1, config.proj_groups) != heads:
                 raise ValueError("GQA checkpoints are not supported by this converter (evo2 uses MHA)")
-            hf[f"{dst}.mixer.qkv_proj.weight"] = _group_qkv_rows(w, heads, head_dim)
+            hf[f"{dst}.mixer.qkv_proj.weight"] = (
+                _group_qkv_rows(w, heads, head_dim) if permute_wqkv else w.contiguous()
+            )
             bkey = f"{src}.inner_mha_cls.Wqkv.bias"
             if bkey in vortex_sd:
-                hf[f"{dst}.mixer.qkv_proj.bias"] = _group_qkv_bias(vortex_sd[bkey], heads, head_dim)
+                b = take(bkey)
+                hf[f"{dst}.mixer.qkv_proj.bias"] = (
+                    _group_qkv_bias(b, heads, head_dim) if permute_wqkv else b.contiguous()
+                )
             hf[f"{dst}.mixer.out_proj.weight"] = take(f"{src}.inner_mha_cls.out_proj.weight")
             obkey = f"{src}.inner_mha_cls.out_proj.bias"
             if obkey in vortex_sd:
-                hf[f"{dst}.mixer.out_proj.bias"] = vortex_sd[obkey]
+                hf[f"{dst}.mixer.out_proj.bias"] = take(obkey)
             hf[f"{dst}.mixer.rotary.inv_freq"] = take(f"{src}.inner_mha_cls.rotary_emb.inv_freq")
         else:
             ftype = "s" if i in (config.hcs_layer_idxs or []) else ("m" if i in (config.hcm_layer_idxs or []) else "l")
@@ -205,11 +212,11 @@ def convert_state_dict(vortex_sd: dict, config: Evo2Config) -> dict:
             hf[f"{dst}.mixer.in_proj.weight"] = take(f"{src}.projections.weight")
             pkey = f"{src}.projections.bias"
             if pkey in vortex_sd:
-                hf[f"{dst}.mixer.in_proj.bias"] = vortex_sd[pkey]
+                hf[f"{dst}.mixer.in_proj.bias"] = take(pkey)
             hf[f"{dst}.mixer.short_conv_weight"] = take(f"{src}.filter.short_filter_weight")
             skey = f"{src}.filter.short_filter_bias"
             if skey in vortex_sd:
-                hf[f"{dst}.mixer.short_conv_bias"] = vortex_sd[skey]
+                hf[f"{dst}.mixer.short_conv_bias"] = take(skey)
             if ftype in ("s", "m"):
                 hf[f"{dst}.mixer.long_filter"] = take(f"{src}.filter.h")
             else:
@@ -217,19 +224,22 @@ def convert_state_dict(vortex_sd: dict, config: Evo2Config) -> dict:
                 hf[f"{dst}.mixer.residues"] = take(f"{src}.filter.residues")
             dkey = f"{src}.filter.D"
             if dkey in vortex_sd:
-                hf[f"{dst}.mixer.D"] = vortex_sd[dkey]
+                hf[f"{dst}.mixer.D"] = take(dkey)
             hf[f"{dst}.mixer.out_proj.weight"] = take(f"{src}.out_filter_dense.weight")
             hf[f"{dst}.mixer.out_proj.bias"] = take(f"{src}.out_filter_dense.bias")
 
     hf["model.final_norm.weight"] = take("norm.scale")
-    if not config.tie_word_embeddings and "unembed.weight" in vortex_sd:
-        hf["lm_head.weight"] = vortex_sd["unembed.weight"]
+    if "unembed.weight" in vortex_sd:
+        if config.tie_word_embeddings:
+            ref = vortex_sd["embedding_layer.weight"].reshape(-1).to(torch.float32)
+            dup = vortex_sd["unembed.weight"].reshape(-1).to(torch.float32)
+            if dup.shape != ref.shape or not torch.equal(dup, ref):
+                raise ValueError("unembed.weight differs from embedding weight despite tie_word_embeddings")
+            consumed.add("unembed.weight")
+        else:
+            hf["lm_head.weight"] = take("unembed.weight")
 
-    used = set()
-    for v in hf.values():
-        used.add(id(v))
-    leftover = [k for k, v in vortex_sd.items()
-                if id(v) not in used and not k.endswith("._extra_state")]
+    leftover = [k for k in vortex_sd if k not in consumed and not k.endswith("._extra_state")]
     if leftover:
         raise ValueError(f"{len(leftover)} vortex keys not consumed, e.g. {leftover[:8]}")
 
@@ -245,6 +255,10 @@ def main() -> None:
     ap.add_argument("--out_dir", required=True, help="output HF folder")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"],
                     help="storage dtype for weights (poles/residues/inv_freq stay fp32)")
+    ap.add_argument("--wqkv_order", default="savanna", choices=["savanna", "grouped"],
+                    help="row order of Wqkv in the vortex file: savanna checkpoints are "
+                    "head-interleaved and need grouping; use grouped if the .pt was saved "
+                    "from an already-loaded vortex model")
     args = ap.parse_args()
 
     try:
@@ -266,7 +280,7 @@ def main() -> None:
     model = Evo2ForCausalLM(config)
     model_state = model.state_dict()
 
-    hf = convert_state_dict(vortex_sd, config)
+    hf = convert_state_dict(vortex_sd, config, permute_wqkv=(args.wqkv_order == "savanna"))
 
     model_keys = set(model_state.keys()) - {"lm_head.weight"}  # tied head is not stored
     if set(hf.keys()) != model_keys:
