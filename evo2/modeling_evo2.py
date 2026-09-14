@@ -1,4 +1,4 @@
-"""Evo2 StripedHyena-2 modeling for transformers, pure torch, no vortex dependency.
+"""Evo2 StripedHyena-2 modeling for transformers.
 
 Reference (read-only, never imported at runtime):
   - https://github.com/ArcInstitute/evo2 (evo2/configs/*.yml, evo2/models.py)
