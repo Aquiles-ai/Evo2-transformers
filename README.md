@@ -24,7 +24,7 @@ If you use Evo 2 in research, cite the original paper (see Citation below), not 
 ## What this port covers
 
 * `evo2/configuration_evo2.py`: `Evo2Config` with layer maps (`attn`, `hcs`, `hcm`, `hcl`), filter lengths, RoPE settings, and presets for all 7 official architectures.
-* `evo2/modeling_evo2.py`: `Evo2Model` and `Evo2ForCausalLM`. Hyena S/M/L mixers, GQA attention with RoPE, vortex-compatible RMSNorm and gated MLP, tied LM head.
+* `evo2/modeling_evo2.py`: `Evo2Model` and `Evo2ForCausalLM`. Hyena S/M/L mixers, GQA attention with RoPE, vortex-compatible RMSNorm and gated MLP, tied LM head, plus a decoding cache (native per-layer states, needs transformers>=5).
 * `evo2/tokenization_evo2.py`: byte-level tokenizer matching the original `CharLevelTokenizer` (vocab 512, `bos/eos=0`, `pad=1`). Includes `vortex_tokenize` and `vortex_detokenize` helpers.
 * `evo2/convert_evo2_vortex_to_hf.py`: converts a merged Vortex `.pt` checkpoint to a Transformers folder (`config.json`, `model.safetensors`, tokenizer files).
 * `scripts/gene_completion.py`: prokaryote gene completion benchmark ported from the original `scripts/gene_completion` script.
@@ -37,7 +37,7 @@ Missing optimizations include:
 
 * No FlashAttention. Attention runs through `scaled_dot_product_attention`.
 * No Transformer Engine, FP8 paths, or fused Triton kernels.
-* No recurrent or stateful decoding. Generation with `use_cache=False` recomputes the full prefix at each step.
+* Decoding cache is supported through the transformers hybrid Cache API (needs transformers>=5), with native per-layer states for attention and Hyena mixers. With `use_cache=False`, generation recomputes the full prefix at each step.
 * Hyena long convolutions run as full precision FFTs per channel, which is `O(N log N)` memory and compute per layer. Long contexts (262k, 1M) are supported by config but slow and memory heavy here.
 * No chunking, no fp16 or bf16 FFT path, no multi-GPU sharding helpers.
 
@@ -91,12 +91,12 @@ with torch.inference_mode():
         do_sample=True,
         temperature=1.0,
         top_k=4,
-        use_cache=False,
+        use_cache=True,
     )
 print(tok.vortex_detokenize(gen[0].tolist()))
 ```
 
-`generate` always runs with `use_cache=False` in this port. Expect it to be slow past a few hundred tokens.
+`generate` uses the decoding cache by default (needs transformers>=5). With `use_cache=False` it recomputes the full prefix at each step, which is slow past a few hundred tokens.
 
 ## Convert a Vortex checkpoint
 

@@ -13,8 +13,8 @@ Data (one file, reference proteins are inside the CSV):
 Deps: torch, transformers, biopython (``pip install biopython``).
 
 Reference (paper): Evo 2 1B base prokaryote mean AA recovery 64.9. The paper
-uses 50 generations/gene; default here is 5 (each generation recomputes the
-full prefix in v1).
+uses 50 generations/gene; default here is 5 with use_cache=True (decode
+from cache, needs transformers>=5).
 """
 
 import csv
@@ -100,7 +100,7 @@ def complete_once(model, tok, prompt, n_tokens, seed):
         gen = model.generate(
             ids, max_new_tokens=n_tokens, do_sample=True,
             temperature=TEMPERATURE, top_k=TOP_K,
-            use_cache=False, pad_token_id=tok.pad_token_id,
+            use_cache=True, pad_token_id=tok.pad_token_id,
         )
     full = "".join(tok.vortex_detokenize(gen[0].tolist()).split()).upper()
     if not full.startswith(prompt):
