@@ -13,21 +13,27 @@ by x2, out_proj, residual, RMSNorm, gated MLP, residual. RMSNorm adds
 eps after the scaled norm, as in vortex. The vortex to HF weight key
 map lives in convert_evo2_vortex_to_hf.py.
 
-v1 scope: training/scoring forward only (use_cache=False). No recurrent
-state decoding yet, so generate recomputes the prefix each step.
-Long context FFT convs run in fp32 at O(N log N) per channel: correct
-but heavy; chunking and fp16/bf16 FFT are TODO.
+Decoding cache (use_cache=True, needs transformers>=5 hybrid Cache API):
+prefill runs the parallel path once and seeds per-layer states, decode
+steps run recurrently with absolute RoPE positions. use_cache=False
+recomputes everything. Long context FFT convs run in fp32 at O(N log N)
+per channel: correct but heavy; chunking and fp16/bf16 FFT are TODO.
 """
 
-import math
-from typing import List, Optional, Tuple
-
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
+
+try:  # transformers>=5 hybrid cache API (DynamicLayer + LinearAttentionLayer)
+    from transformers.cache_utils import Cache, DynamicLayer, LinearAttentionLayer
+    _HAS_HF_CACHE = True
+except Exception:
+    Cache = DynamicLayer = LinearAttentionLayer = None
+    _HAS_HF_CACHE = False
 
 try:
     from .configuration_evo2 import Evo2Config
@@ -172,10 +178,42 @@ class Evo2MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
+
+# Hybrid cache: one native layer object per decoder layer. Attention
+# layers use DynamicLayer (k/v); Hyena layers use Evo2HyenaCacheLayer
+# with two states: short-FIR history (state 0) and long-conv history or
+# IIR recurrent state (state 1). The mixer owns the math; the container
+# only adapts it to generate (length, reorder, crop, reset).
+
+class Evo2HyenaCacheLayer(LinearAttentionLayer if _HAS_HF_CACHE else object):
+    """Storage for one Hyena layer's recurrent state (math lives in the mixer)."""
+
+    def __init__(self):
+        if _HAS_HF_CACHE:
+            super().__init__(number_of_states=2)
+        else:
+            self.conv_states = {}
+            self.recurrent_states = {}
+            self.is_conv_states_initialized = {}
+            self.is_recurrent_states_initialized = {}
+            self.has_previous_state = {}
+            self.conv_kernel_size = {}
+
+    def mark_ready(self, device, dtype, long_kernel: int, recurrent: bool) -> None:
+        self.device = device
+        self.dtype = dtype
+        self.conv_kernel_size[0] = 2
+        self.conv_kernel_size[1] = long_kernel
+        self.is_conv_states_initialized[0] = True
+        self.is_conv_states_initialized[1] = not recurrent
+        self.is_recurrent_states_initialized[0] = recurrent
+        self.has_previous_state[0] = True
+        self.has_previous_state[1] = True
+
 # Mixers
 
 class Evo2Attention(nn.Module):
-    """GQA + RoPE attention over SDPA (no flash-attn / TE in v1)."""
+    """GQA + RoPE attention over SDPA (no flash-attn / TE)."""
 
     def __init__(self, config: Evo2Config):
         super().__init__()
@@ -195,6 +233,8 @@ class Evo2Attention(nn.Module):
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        past_layer=None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
         qkv = self.qkv_proj(x)
@@ -205,17 +245,33 @@ class Evo2Attention(nn.Module):
         v = qkv[..., kv_end:].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         if position_ids is None:
             position_ids = torch.arange(seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
-        cos, sin = self.rotary._cos_sin(seqlen, position_ids, x.dtype, x.device)
+        cos, sin = self.rotary._cos_sin(
+            int(position_ids.max().item()) + 1, position_ids, x.dtype, x.device)
         q, k = self.rotary.apply(q, k, cos, sin)
-        k = _repeat_kv(k, self.n_rep)
-        v = _repeat_kv(v, self.n_rep)
-        q = q.transpose(1, 2)  # [B, H, L, D]
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        if use_cache and past_layer is not None:
+            k_full, v_full = past_layer.update(k.transpose(1, 2), v.transpose(1, 2))
+            k = _repeat_kv(k_full.transpose(1, 2), self.n_rep).transpose(1, 2)
+            v = _repeat_kv(v_full.transpose(1, 2), self.n_rep).transpose(1, 2)
+        else:
+            k = _repeat_kv(k, self.n_rep).transpose(1, 2)
+            v = _repeat_kv(v, self.n_rep).transpose(1, 2)
+        q = q.transpose(1, 2)  # [B, H, Lq, D]; k/v already [B, H, K, D]
         if attention_mask is not None:
-            # Expect [B, L] with 1 = keep. SDPA needs additive [B, 1, 1, L] or bool.
+            # Expect [B, L] with 1 = keep. Some generate paths hand a per-step
+            # mask ([B, 1]) on decode; the cached prefix was valid, extend it.
             mask = attention_mask.to(x.dtype)
-            additive = (1.0 - mask[:, None, None, :]) * torch.finfo(x.dtype).min
+            if mask.shape[-1] != k.shape[2]:
+                if mask.shape[-1] == q.shape[2] and k.shape[2] > mask.shape[-1]:
+                    pad = torch.ones(mask.shape[0], k.shape[2] - mask.shape[-1],
+                                     device=mask.device, dtype=mask.dtype)
+                    mask = torch.cat([pad, mask], dim=-1)
+                elif bool((mask == 1).all()):
+                    mask = None
+                else:
+                    raise ValueError(
+                        f"attention_mask length {mask.shape[-1]} matches neither "
+                        f"keys ({k.shape[2]}) nor queries ({q.shape[2]})")
+            additive = None if mask is None else (1.0 - mask[:, None, None, :]) * torch.finfo(x.dtype).min
         else:
             additive = None
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=additive, dropout_p=0.0, is_causal=additive is None)
@@ -307,17 +363,84 @@ class Evo2HyenaMixer(nn.Module):
         h = (self.residues.to(torch.float32)[..., None] * (self.log_poles.to(torch.float32) * t).exp()).sum(1)[None]
         return h.to(dtype)
 
-    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    @staticmethod
+    def _tail(t: torch.Tensor, k: int) -> torch.Tensor:
+        """Last ``k`` vectors, left zero-padded (matches causal conv padding)."""
+        if t.shape[-1] >= k:
+            return t[..., -k:]
+        pad = torch.zeros(*t.shape[:-1], k - t.shape[-1], device=t.device, dtype=t.dtype)
+        return torch.cat([pad, t], dim=-1)
+
+    def _init_fir_state(self, st, z_pre: torch.Tensor, u: torch.Tensor) -> None:
+        st.conv_states[0] = self._tail(z_pre, 2).to(torch.float32)
+        st.conv_states[1] = self._tail(u, self.filter_len - 1).to(torch.float32)
+        st.mark_ready(z_pre.device, z_pre.dtype, self.filter_len - 1, recurrent=False)
+
+    def _init_iir_state(self, st, z_pre: torch.Tensor, x1v: torch.Tensor) -> None:
+        if self.groups != self.hidden_size:
+            raise ValueError("cached HCL step needs per-channel systems (groups == hidden)")
+        st.conv_states[0] = self._tail(z_pre, 2).to(torch.float32)
+        a = self.log_poles.to(torch.float32)[:, :, 0].exp()  # [H, S] discrete poles
+        u32 = x1v.to(torch.float32)  # [B, H, L]
+        s = torch.zeros(u32.shape[0], self.hidden_size, self.state_size,
+                        device=u32.device, dtype=torch.float32)
+        for t in range(u32.shape[-1]):
+            s = a[None] * s + u32[..., t, None]
+        st.recurrent_states[0] = s
+        st.mark_ready(z_pre.device, z_pre.dtype, 0, recurrent=True)
+
+    def _decode_step(self, z: torch.Tensor, padding_mask: Optional[torch.Tensor], st) -> torch.Tensor:
+        # z: [B, 3H, 1] in_proj output for the new token. Histories are fp32.
+        dt = z.dtype
+        w = self.short_conv_weight.to(torch.float32).squeeze(1)  # [3H, 3]
+        win = torch.cat([st.conv_states[0], z.to(torch.float32)], dim=-1)
+        s = (w[None] * win).sum(-1)
+        if self.short_conv_bias is not None:
+            s = s + self.short_conv_bias.to(torch.float32)[None]
+        st.conv_states[0] = win[..., 1:]
+        s1 = s.to(dt)[..., None]
+        if self.interleave:
+            s1 = _interleave(s1)
+        x2, x1, v = self._split(s1)
+        u = (x1 * v).to(torch.float32)[..., 0]  # [B, H]
+        if self.filter_type in ("s", "m"):
+            h = self._long_filter_matrix().to(torch.float32).squeeze(1)  # [H, K]
+            if self.filter_len >= 128:
+                h = h.flip(-1)
+            hist = st.conv_states[1]
+            y = (h[None] * torch.cat([hist, u[..., None]], dim=-1)).sum(-1)
+            if self.filter_type == "m":
+                y = y + self.D.to(torch.float32)[None] * u
+            st.conv_states[1] = torch.cat([hist[..., 1:], u[..., None]], dim=-1)
+            y = y.to(dt)[..., None] * x2
+        else:
+            if self.groups != self.hidden_size:
+                raise ValueError("cached HCL step needs per-channel systems (groups == hidden)")
+            a = self.log_poles.to(torch.float32)[:, :, 0].exp()
+            r = self.residues.to(torch.float32)
+            s_state = a[None] * st.recurrent_states[0] + u[..., None]
+            st.recurrent_states[0] = s_state
+            y = ((r[None] * s_state).sum(-1) + self.D.to(torch.float32)[None] * u).to(dt)[..., None] * x2
+            if isinstance(padding_mask, torch.Tensor):
+                y = y * padding_mask[:, None, :]
+        return self.out_proj(y.permute(0, 2, 1))
+
+    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,
+                hyena_state=None, use_cache: bool = False) -> torch.Tensor:
         # x: [B, L, H] -> [B, 3H, L]
         z = self.in_proj(x).permute(0, 2, 1)
         L = z.shape[-1]
-        z = _causal_depthwise_conv1d(z, self.short_conv_weight, self.short_conv_bias)
+        if use_cache and hyena_state is not None and L == 1:
+            if hyena_state.conv_states.get(0) is None:
+                raise RuntimeError("decode step needs a prefilled cache (run the prompt first)")
+            return self._decode_step(z, padding_mask, hyena_state)
+        zc = _causal_depthwise_conv1d(z, self.short_conv_weight, self.short_conv_bias)
         if self.interleave:
-            z = _interleave(z)
+            zc = _interleave(zc)
 
         if self.filter_type in ("s", "m"):
             # Short/medium FIR path (D skip only when len>=128).
-            x2, x1, v = self._split(z)
+            x2, x1, v = self._split(zc)
             u = x1 * v
             h = self._long_filter_matrix()
             if self.filter_len >= 128:
@@ -326,9 +449,12 @@ class Evo2HyenaMixer(nn.Module):
             else:
                 y = _causal_depthwise_conv1d(u, h, bias=None)
             y = x2 * y
-            return self.out_proj(y.permute(0, 2, 1))
+            out = self.out_proj(y.permute(0, 2, 1))
+            if use_cache and hyena_state is not None:
+                self._init_fir_state(hyena_state, z, u)
+            return out
 
-        x2, x1, v = self._split(z)
+        x2, x1, v = self._split(zc)
         x1v = x1 * v
         h = self._iir_filter(L, x.device, x1v.dtype)
         assert self.D is not None
@@ -337,7 +463,10 @@ class Evo2HyenaMixer(nn.Module):
         # Padding mask (vortex multiplies post-FIR when bias present); apply cheaply.
         if isinstance(padding_mask, torch.Tensor):
             y = y * padding_mask[:, None, :]
-        return self.out_proj(y.permute(0, 2, 1))
+        out = self.out_proj(y.permute(0, 2, 1))
+        if use_cache and hyena_state is not None:
+            self._init_iir_state(hyena_state, z, x1v)
+        return out
 
 
 # Decoder layer / full model / causal LM
@@ -365,24 +494,34 @@ class Evo2DecoderLayer(nn.Module):
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        past_key_values=None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
+        L = x.shape[1]
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[1] != L:
+            mask_cur = attention_mask[:, -L:]
+        else:
+            mask_cur = attention_mask
+        layer_state = past_key_values.layers[self.layer_idx] if use_cache and past_key_values is not None else None
         if isinstance(self.mixer, Evo2Attention):
-            if isinstance(attention_mask, torch.Tensor):
-                x_masked = x * attention_mask[..., None].to(x.dtype)
+            if isinstance(mask_cur, torch.Tensor):
+                x_masked = x * mask_cur[..., None].to(x.dtype)
             else:
                 x_masked = x
-            h = self.mixer(self.mixer_norm(x_masked), attention_mask=attention_mask, position_ids=position_ids) + x
+            h = self.mixer(self.mixer_norm(x_masked), attention_mask=attention_mask,
+                           position_ids=position_ids, past_layer=layer_state, use_cache=use_cache) + x
         else:
-            h = self.mixer(self.mixer_norm(x), padding_mask=attention_mask) + x
-            if isinstance(attention_mask, torch.Tensor):
-                h = h * attention_mask[..., None].to(h.dtype)
+            h = self.mixer(self.mixer_norm(x), padding_mask=mask_cur,
+                           hyena_state=layer_state, use_cache=use_cache) + x
+            if isinstance(mask_cur, torch.Tensor):
+                h = h * mask_cur[..., None].to(h.dtype)
         return self.mlp(self.mlp_norm(h)) + h
 
 
 class Evo2PreTrainedModel(PreTrainedModel):
     config_class = Evo2Config
     base_model_prefix = "model"
-    supports_gradient_checkpointing = False  # TODO once cache/recurrence lands
+    supports_gradient_checkpointing = False
     _no_split_modules = ["Evo2DecoderLayer"]
 
 
@@ -394,6 +533,14 @@ class Evo2Model(Evo2PreTrainedModel):
         self.final_norm = Evo2RMSNorm(config) if config.final_norm else nn.Identity()
         self.post_init()
 
+    def _build_cache(self):
+        if not _HAS_HF_CACHE:
+            raise RuntimeError("use_cache=True needs transformers>=5 hybrid Cache API")
+        layers = []
+        for layer in self.layers:
+            layers.append(DynamicLayer() if isinstance(layer.mixer, Evo2Attention) else Evo2HyenaCacheLayer())
+        return Cache(layers=layers)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -402,6 +549,8 @@ class Evo2Model(Evo2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        past_key_values=None,
+        use_cache: bool = False,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if input_ids is not None:
@@ -412,21 +561,41 @@ class Evo2Model(Evo2PreTrainedModel):
             raise ValueError("Provide input_ids or inputs_embeds")
         bsz, seqlen = x.shape[:2]
         if position_ids is None:
-            position_ids = torch.arange(seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
+            start = 0
+            if use_cache and past_key_values is not None:
+                try:
+                    start = int(past_key_values.get_seq_length())
+                except Exception:
+                    start = 0
+            position_ids = torch.arange(start, start + seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
         if attention_mask is not None:
-            x = x * attention_mask[..., None].to(x.dtype)
+            mask_cur = attention_mask if attention_mask.shape[1] == seqlen else attention_mask[:, -seqlen:]
+            x = x * mask_cur[..., None].to(x.dtype)
+        if use_cache:
+            if not _HAS_HF_CACHE:
+                raise RuntimeError("use_cache=True needs transformers>=5 hybrid Cache API")
+            if past_key_values is None or not isinstance(past_key_values, Cache):
+                try:
+                    foreign_len = 0 if past_key_values is None else past_key_values.get_seq_length()
+                except Exception:
+                    foreign_len = 1
+                if foreign_len > 0:
+                    raise ValueError("use_cache=True with a foreign non-empty cache")
+                past_key_values = self._build_cache()
         all_hidden = [] if output_hidden_states else None
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden.append(x)
-            x = layer(x, attention_mask=attention_mask, position_ids=position_ids)
+            x = layer(x, attention_mask=attention_mask, position_ids=position_ids,
+                      past_key_values=past_key_values, use_cache=use_cache)
         x = self.final_norm(x)
         if output_hidden_states:
             assert all_hidden is not None
             all_hidden.append(x)
+        past_out = past_key_values if use_cache else None
         if not return_dict:
-            return (x, None, all_hidden)
-        return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=None, hidden_states=all_hidden)
+            return (x, past_out, all_hidden)
+        return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=past_out, hidden_states=all_hidden)
 
 
 class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
@@ -447,6 +616,8 @@ class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        past_key_values=None,
+        use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         out = self.model(
@@ -455,6 +626,8 @@ class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_hidden_states=output_hidden_states,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
             return_dict=True,
         )
         logits = self.lm_head(out.last_hidden_state).float()
@@ -463,15 +636,27 @@ class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        past_out = out.past_key_values if use_cache else None
         if not return_dict:
-            return (loss, logits, None, out.hidden_states) if loss is not None else (logits, None, out.hidden_states)
+            return (loss, logits, past_out, out.hidden_states) if loss is not None else (logits, past_out, out.hidden_states)
         return CausalLMOutputWithPast(
-            loss=loss, logits=logits, past_key_values=None, hidden_states=out.hidden_states
+            loss=loss, logits=logits, past_key_values=past_out, hidden_states=out.hidden_states
         )
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
-        # v1: no KV/Hyena-state cache, full recompute (use_cache=False).
-        out = {"input_ids": input_ids}
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None,
+                                      position_ids=None, **kwargs):
+        # Decode only with a non-empty cache (generate hands an empty
+        # DynamicCache on the first call); prefill keeps the full prompt.
+        try:
+            decoding = past_key_values is not None and past_key_values.get_seq_length() > 0
+        except Exception:
+            decoding = past_key_values is not None
+        if decoding:
+            cache_len = past_key_values.get_seq_length()
+            input_ids = input_ids[:, -1:]
+            position_ids = torch.arange(cache_len, cache_len + 1, device=input_ids.device
+                                        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        out = {"input_ids": input_ids, "past_key_values": past_key_values, "position_ids": position_ids}
         if attention_mask is not None:
             out["attention_mask"] = attention_mask
         return out
@@ -486,5 +671,6 @@ __all__ = [
     "Evo2MLP",
     "Evo2Attention",
     "Evo2HyenaMixer",
+    "Evo2HyenaCacheLayer",
     "Evo2DecoderLayer",
 ]

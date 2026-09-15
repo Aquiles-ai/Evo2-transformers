@@ -15,6 +15,8 @@ class Evo2Config(PretrainedConfig):
             # Number of independent filters in Hyena-LI
             num_filters: int = 1920,
             num_layers: int = 25,
+            # Same as num_layers; transformers generate() needs this name to build its cache
+            num_hidden_layers: Optional[int] = None,
             attn_layer_idxs: List[int] | None = None,
             hcl_layer_idxs: List[int] | None = None,
             hcm_layer_idxs: List[int] | None = None,
@@ -64,6 +66,7 @@ class Evo2Config(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_filters = num_filters
         self.num_layers = num_layers
+        self.num_hidden_layers = num_layers if num_hidden_layers is None else num_hidden_layers
         self.attn_layer_idxs = attn_layer_idxs if attn_layer_idxs is not None else [3, 10, 17, 24]
         self.hcl_layer_idxs = hcl_layer_idxs if hcl_layer_idxs is not None else [2, 6, 9, 13, 16, 20, 23]
         self.hcm_layer_idxs = hcm_layer_idxs if hcm_layer_idxs is not None else [1, 5, 8, 12, 15, 19, 22]
