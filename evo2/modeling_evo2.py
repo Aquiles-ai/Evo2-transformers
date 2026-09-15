@@ -539,7 +539,9 @@ class Evo2Model(Evo2PreTrainedModel):
         layers = []
         for layer in self.layers:
             layers.append(DynamicLayer() if isinstance(layer.mixer, Evo2Attention) else Evo2HyenaCacheLayer())
-        return Cache(layers=layers)
+        cache = Cache(layers=layers)
+        cache._is_evo2_hybrid = True
+        return cache
 
     def forward(
         self,
@@ -574,7 +576,7 @@ class Evo2Model(Evo2PreTrainedModel):
         if use_cache:
             if not _HAS_HF_CACHE:
                 raise RuntimeError("use_cache=True needs transformers>=5 hybrid Cache API")
-            if past_key_values is None or not isinstance(past_key_values, Cache):
+            if past_key_values is None or not getattr(past_key_values, "_is_evo2_hybrid", False):
                 try:
                     foreign_len = 0 if past_key_values is None else past_key_values.get_seq_length()
                 except Exception:
@@ -657,6 +659,7 @@ class Evo2ForCausalLM(Evo2PreTrainedModel, GenerationMixin):
             position_ids = torch.arange(cache_len, cache_len + 1, device=input_ids.device
                                         ).unsqueeze(0).expand(input_ids.shape[0], -1)
         out = {"input_ids": input_ids, "past_key_values": past_key_values, "position_ids": position_ids}
+        out["use_cache"] = kwargs.get("use_cache", True)
         if attention_mask is not None:
             out["attention_mask"] = attention_mask
         return out
