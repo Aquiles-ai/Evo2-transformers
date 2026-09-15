@@ -10,7 +10,7 @@ Edit CONFIG below and run: python gene_completion.py.
 Data (one file, reference proteins are inside the CSV):
     wget https://raw.githubusercontent.com/ArcInstitute/evo2/main/scripts/gene_completion/data/prokaryote_genes.csv
 
-Deps: torch, transformers, biopython (``pip install biopython``).
+Deps: torch, transformers==5.17.0, biopython (``pip install biopython``).
 
 Reference (paper): Evo 2 1B base prokaryote mean AA recovery 64.9. The paper
 uses 50 generations/gene; default here is 5 with use_cache=True (decode
@@ -19,6 +19,9 @@ from cache, needs transformers>=5).
 
 import csv
 import os
+import subprocess
+import threading
+import time
 import torch
 from Bio.Align import PairwiseAligner, substitution_matrices
 from Bio.Seq import Seq
@@ -35,11 +38,65 @@ TOP_K = 4
 SEED = 0
 PROMPT_FRACTION = 0.30
 PROK_UPSTREAM_LEN = 1000
+MONITOR_EVERY_S = 15  # background GPU/progress line cadence, 0 = off
 
 os.makedirs(OUT_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE.startswith("cuda") else torch.float32
 
+PROG = {"gene": "", "idx": -1, "tokens": 0, "t_start": 0.0, "t_last": 0.0}
+
+class _CountStreamer:
+    def put(self, value):
+        n = value.numel() if isinstance(value, torch.Tensor) else len(value)
+        PROG["tokens"] += int(n)
+        PROG["t_last"] = time.time()
+
+    def end(self):
+        PROG["t_last"] = time.time()
+
+_STREAMER = _CountStreamer()
+_MON_STOP = threading.Event()
+
+def _gpu_line():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().split(",")
+        util, used, total, temp = [x.strip() for x in out]
+        return f"gpu={util}% vram={used}/{total}MiB {temp}C"
+    except Exception:
+        return "gpu=n/a"
+
+def _monitor_loop(every_s):
+    t0 = time.time()
+    last_n = 0
+    while not _MON_STOP.wait(every_s):
+        now = time.time()
+        n = PROG["tokens"]
+        if n < last_n:
+            last_n = n
+        rate = (n - last_n) / every_s
+        last_n = n
+        idle = now - PROG["t_last"] if PROG["t_last"] else 0.0
+        flag = " STALL?" if PROG["t_start"] and idle > 2 * every_s else ""
+        own = ""
+        if DEVICE.startswith("cuda"):
+            own = f" self={torch.cuda.memory_allocated() / 2 ** 20:.0f}MiB"
+        print(f"[mon {now - t0:7.0f}s] {PROG['gene']} gen{PROG['idx']} "
+              f"tok={n} {rate:4.1f}tok/s idle={idle:4.0f}s | {_gpu_line()}{own}{flag}",
+              flush=True)
+
+def start_monitor():
+    if not MONITOR_EVERY_S:
+        return None
+    PROG["t_start"] = time.time()
+    PROG["t_last"] = time.time()
+    th = threading.Thread(target=_monitor_loop, args=(MONITOR_EVERY_S,), daemon=True)
+    th.start()
+    return th
 
 def prokaryote_prompt(genomic, cds_start=5000, upstream_len=PROK_UPSTREAM_LEN,
                       fraction=PROMPT_FRACTION):
@@ -51,14 +108,12 @@ def prokaryote_prompt(genomic, cds_start=5000, upstream_len=PROK_UPSTREAM_LEN,
     prompt = genomic[start:cds_start] + genomic[cds_start:cds_start + take_nt]
     return prompt, coding_aa_take
 
-
 def translate_dna(dna, to_stop=True):
     dna = "".join(dna.split()).upper()
     usable = len(dna) - (len(dna) % 3)
     if usable <= 0:
         return ""
     return str(Seq(dna[:usable]).translate(to_stop=to_stop))
-
 
 _ALIGNER = None
 
@@ -96,11 +151,14 @@ def score_prokaryote(generated_full, reference_protein, upstream_len, prompt_cds
 def complete_once(model, tok, prompt, n_tokens, seed):
     torch.manual_seed(seed)
     ids = torch.tensor([tok.vortex_tokenize(prompt)], dtype=torch.long, device=DEVICE)
+    PROG["tokens"] = 0
+    PROG["t_last"] = time.time()
     with torch.inference_mode():
         gen = model.generate(
             ids, max_new_tokens=n_tokens, do_sample=True,
             temperature=TEMPERATURE, top_k=TOP_K,
             use_cache=True, pad_token_id=tok.pad_token_id,
+            streamer=_STREAMER if MONITOR_EVERY_S else None,
         )
     full = "".join(tok.vortex_detokenize(gen[0].tolist()).split()).upper()
     if not full.startswith(prompt):
@@ -123,9 +181,10 @@ def main():
 
     raw_path = os.path.join(OUT_DIR, f"{TAG}_prokaryote_completions.csv")
     gene_means = {}
+    start_monitor()
     with open(raw_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["gene", "organism", "gen_idx", "aa_recovery_non_prompt", "prompt_len"])
+        w.writerow(["gene", "organism", "gen_idx", "aa_recovery_non_prompt", "prompt_len", "completion"])
         for row in rows:
             gene = row["gene"]
             genomic = "".join(str(row["genomic_sequence"]).split()).upper()
@@ -138,10 +197,12 @@ def main():
             print(f"[{gene}] prompt={len(prompt)} nt, n_tokens={n_tokens}, gens={N_GEN}")
             scores = []
             for g in range(N_GEN):
+                PROG["gene"] = gene
+                PROG["idx"] = g
                 full = complete_once(model, tok, prompt, n_tokens, SEED + g)
                 rec = score_prokaryote(full, ref_protein, PROK_UPSTREAM_LEN, prompt_cds_aa)
                 scores.append(rec)
-                w.writerow([gene, row.get("organism", ""), g, f"{rec:.2f}", len(prompt)])
+                w.writerow([gene, row.get("organism", ""), g, f"{rec:.2f}", len(prompt), full])
                 print(f"  gen {g}: AA recovery={rec:.2f}%")
             gene_means[gene] = sum(scores) / len(scores)
 
@@ -152,6 +213,7 @@ def main():
         for gene, mean in gene_means.items():
             w.writerow([gene, N_GEN, f"{mean:.2f}"])
     panel = sum(gene_means.values()) / len(gene_means)
+    _MON_STOP.set()
     print(f"\nWrote {raw_path}\nWrote {stats_path}")
     print(f"Panel mean AA recovery: {panel:.2f}% (ref 1B base: 64.9)")
 
