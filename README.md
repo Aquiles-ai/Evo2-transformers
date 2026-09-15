@@ -2,7 +2,7 @@
 
 # Evo2-transformers
 
-<img src="./images/Evo2.png" width="800"/>
+<img src="./images/Evo2.png" width="400"/>
 
 </div>
 
