@@ -1,4 +1,10 @@
+<div align="center">
+
 # Evo2-transformers
+
+<img src="./images/Evo2.png" width="800"/>
+
+</div>
 
 Unofficial PyTorch and Transformers port of Evo 2 inference. All model, data, and research credit goes to the original Evo 2 team at Arc Institute and collaborators.
 
